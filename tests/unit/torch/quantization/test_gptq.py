@@ -17,7 +17,10 @@
 
 import torch
 
-from modelopt.torch.quantization.utils.calib_utils import update_hessian
+from modelopt.torch.quantization.utils.calib_utils import (
+    compute_hessian_inverse,
+    update_hessian,
+)
 
 
 def test_update_hessian():
@@ -117,3 +120,63 @@ def test_update_hessian_zero_token_input_noops():
     assert updated_hessian is hessian
     assert new_n_samples == n_samples
     torch.testing.assert_close(hessian, expected_hessian)
+
+
+def test_compute_hessian_inverse_zeros_hessian_dead_weight_columns():
+    """An inactive Hessian dimension, not weight content, defines a dead column."""
+    hessian = torch.diag(torch.tensor([2.0, 0.0, 4.0]))
+    weight = torch.tensor([[1.0, 2.0, 0.0], [3.0, 4.0, 0.0]])
+
+    h_inv = compute_hessian_inverse(hessian, weight, perc_damp=0.01)
+
+    assert h_inv is not None
+    torch.testing.assert_close(weight[:, 1], torch.zeros(2))
+    # Column 2 is all-zero but has a live Hessian dimension; it must not affect
+    # dead-dimension classification or be otherwise special-cased.
+    torch.testing.assert_close(weight[:, 0], torch.tensor([1.0, 3.0]))
+    torch.testing.assert_close(weight[:, 2], torch.zeros(2))
+
+
+def test_compute_hessian_inverse_does_not_zero_live_all_zero_weight_column():
+    """A live Hessian dimension is not dead merely because its weight column is zero."""
+    hessian = torch.diag(torch.tensor([2.0, 3.0]))
+    weight = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+    expected_weight = weight.clone()
+
+    h_inv = compute_hessian_inverse(hessian, weight, perc_damp=0.01)
+
+    assert h_inv is not None
+    torch.testing.assert_close(weight, expected_weight)
+
+
+def test_compute_hessian_inverse_cpu_factorization_returns_to_weight_device():
+    """CPU factorization preserves the public result-device contract."""
+    hessian = torch.diag(torch.tensor([2.0, 3.0]))
+    weight = torch.tensor([[1.0, 2.0]])
+
+    expected = compute_hessian_inverse(hessian, weight.clone(), perc_damp=0.01)
+    actual = compute_hessian_inverse(
+        hessian, weight, perc_damp=0.01, factorization_device="cpu"
+    )
+
+    assert actual is not None
+    assert actual.device == weight.device
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compute_hessian_inverse_float64_factorization_returns_weight_dtype():
+    hessian = torch.tensor([[2.0, 0.25], [0.25, 3.0]], dtype=torch.float32)
+    weight = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+
+    expected = compute_hessian_inverse(hessian, weight.clone(), perc_damp=0.01)
+    actual = compute_hessian_inverse(
+        hessian,
+        weight,
+        perc_damp=0.01,
+        factorization_device="cpu",
+        factorization_dtype="float64",
+    )
+
+    assert actual is not None
+    assert actual.dtype == weight.dtype
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)

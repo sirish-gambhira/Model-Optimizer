@@ -687,6 +687,22 @@ class TestLayerwiseNestedConfig:
         cfg = GPTQCalibConfig(layerwise=layerwise_input)
         assert cfg.layerwise.get_qdq_activations_from_prev_layer is expected_qdq
 
+    def test_gptq_rtn_fallback_config(self):
+        cfg = GPTQCalibConfig(
+            module_patterns=["*experts*"],
+            rtn_fallback={
+                "min_samples_per_input_dim": 2.0,
+                "module_patterns": ["*experts*"],
+            },
+        )
+        assert cfg.module_patterns == ["*experts*"]
+        assert cfg.rtn_fallback.min_samples_per_input_dim == 2.0
+        assert cfg.rtn_fallback.module_patterns == ["*experts*"]
+
+    def test_gptq_rtn_fallback_ratio_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            GPTQCalibConfig(rtn_fallback={"min_samples_per_input_dim": 0.0})
+
     def test_default_dump_shape(self):
         dumped = MaxCalibConfig().model_dump()
         assert dumped["layerwise"] == {
