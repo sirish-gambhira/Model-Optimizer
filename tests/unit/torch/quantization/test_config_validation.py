@@ -703,11 +703,20 @@ class TestLayerwiseNestedConfig:
         with pytest.raises(ValidationError):
             GPTQCalibConfig(rtn_fallback={"min_samples_per_input_dim": 0.0})
 
+    def test_gptq_cpu_memory_controls(self):
+        cfg = GPTQCalibConfig(
+            hessian_storage_device="cpu",
+            layerwise={"enable": True, "offload_activations_to_cpu": True},
+        )
+        assert cfg.hessian_storage_device == "cpu"
+        assert cfg.layerwise.offload_activations_to_cpu is True
+
     def test_default_dump_shape(self):
         dumped = MaxCalibConfig().model_dump()
         assert dumped["layerwise"] == {
             "enable": False,
             "get_qdq_activations_from_prev_layer": False,
+            "offload_activations_to_cpu": False,
             "checkpoint_dir": None,
             "save_every": 1,
             "calib_mutates_weights": True,

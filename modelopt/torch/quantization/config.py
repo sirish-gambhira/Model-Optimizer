@@ -740,6 +740,16 @@ class LayerwiseConfig(ModeloptBaseConfig):
         ),
     )
 
+    offload_activations_to_cpu: bool = ModeloptField(
+        default=False,
+        title="Store cached layer inputs in CPU memory.",
+        description=(
+            "If True, move layer-input activation caches to CPU after capture and "
+            "copy each replay batch back to the calibrated layer's device. This "
+            "reduces persistent GPU memory at the cost of host-device transfers."
+        ),
+    )
+
     checkpoint_dir: str | None = ModeloptField(
         default=None,
         title="Per-layer checkpoint directory (resume on restart).",
@@ -1345,6 +1355,15 @@ class GPTQCalibConfig(QuantizeAlgorithmConfig):
         description=(
             "Factorize the dense damped Hessian in float32 or float64. The resulting "
             "inverse-Cholesky factor is converted back to the working-weight dtype."
+        ),
+    )
+    hessian_storage_device: Literal["auto", "current", "cpu"] = ModeloptField(
+        default="auto",
+        title="Device used to accumulate GPTQ Hessians",
+        description=(
+            "'auto' moves Hessians to CPU once their weight device exceeds the memory "
+            "threshold. 'current' always accumulates beside the weight. 'cpu' always "
+            "accumulates in host memory before factorization."
         ),
     )
     hessian_diagnostic_dir: str | None = ModeloptField(

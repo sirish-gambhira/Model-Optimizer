@@ -35,12 +35,17 @@ from modelopt.torch.opt.searcher import ForwardLoop
 from modelopt.torch.quantization.utils.layerwise_calib import (
     LayerActivationCollector,
     _CheckpointState,
+    _move_to_device,
 )
 from modelopt.torch.utils import print_rank_0, warn_rank_0
 from modelopt.torch.utils.distributed import DistributedProcessGroup, ParallelState, is_master
 from modelopt.torch.utils.distributed import is_initialized as dist_is_initialized
 from modelopt.torch.utils.distributed import size as dist_size
-from modelopt.torch.utils.network import bind_forward_method, unpatch_forward_method
+from modelopt.torch.utils.network import (
+    bind_forward_method,
+    get_module_device,
+    unpatch_forward_method,
+)
 
 from .calib import MseCalibrator, NVFP4ActHeadroomCalibrator, NVFP4MSECalibrator, _Calibrator
 from .conversion import create_and_replace_svdquant_linear_on_the_fly, set_quantizer_by_cfg_context
@@ -2072,6 +2077,7 @@ def layerwise_calibrate(
     """
     checkpoint_dir = calib_kwargs.pop("checkpoint_dir", None)
     qdq_from_prev = calib_kwargs.pop("get_qdq_activations_from_prev_layer", False)
+    offload_activations_to_cpu = calib_kwargs.pop("offload_activations_to_cpu", False)
     save_every = calib_kwargs.pop("save_every", 1)
     calib_mutates_weights = calib_kwargs.pop("calib_mutates_weights", True)
 
@@ -2110,7 +2116,11 @@ def layerwise_calibrate(
     def _set_layer_status(status: str):
         layer_pbar.set_postfix_str(status, refresh=True)
 
-    input_getter = LayerActivationCollector(model, status_callback=_set_layer_status)
+    input_getter = LayerActivationCollector(
+        model,
+        status_callback=_set_layer_status,
+        offload_activations_to_cpu=offload_activations_to_cpu,
+    )
 
     try:
         input_getter._patch_all_layers(decoder_layers=transformer_layers)
@@ -2126,6 +2136,10 @@ def layerwise_calibrate(
 
             def _layer_forward_loop(m, _inputs=layer_inputs):
                 for args, kwargs_input in _inputs:
+                    if offload_activations_to_cpu:
+                        device = get_module_device(m)
+                        args = _move_to_device(args, device)
+                        kwargs_input = _move_to_device(kwargs_input, device)
                     # Reset past_key_values to prevent the KV cache from
                     # accumulating across multiple forward replays (e.g.
                     # max_calibrate then Hessian collection in GPTQ).
@@ -2136,11 +2150,7 @@ def layerwise_calibrate(
                         and kwargs_input["past_key_values"] is not None
                     ):
                         kwargs_input = dict(kwargs_input)
-                        cache = kwargs_input["past_key_values"]
-                        if hasattr(cache, "reset"):
-                            cache.reset()
-                        else:
-                            kwargs_input["past_key_values"] = None
+                        kwargs_input["past_key_values"] = None
                     m(*args, **kwargs_input)
 
             is_last = layer_idx + 1 >= num_layers
@@ -2201,6 +2211,7 @@ def gptq(
     dynamic_scale_candidates: int = 8,
     hessian_inverse_device: str = "current",
     hessian_inverse_dtype: str = "float32",
+    hessian_storage_device: str = "auto",
     hessian_diagnostic_dir: str | None = None,
     hessian_diagnostic_only: bool = False,
     scale_algorithm: dict | None = None,
@@ -2243,6 +2254,9 @@ def gptq(
         hessian_inverse_device: Device for the dense Hessian factorization. ``'current'``
             uses the weight device; ``'cpu'`` factorizes on CPU and copies the resulting
             upper-Cholesky inverse factor back to the weight device.
+        hessian_storage_device: Device used to accumulate Hessians. ``'auto'`` uses the
+            existing memory-pressure heuristic, ``'current'`` keeps them beside the
+            weights, and ``'cpu'`` always stores them in host memory.
         hessian_diagnostic_dir: Optional directory for raw per-module Hessian snapshots.
         hessian_diagnostic_only: Save Hessians and skip inversion and GPTQ weight updates.
         scale_algorithm: Weight-scale calibration run before the update, as a dict with a
@@ -2259,6 +2273,10 @@ def gptq(
 
     # The scales GPTQ optimizes against are set here and then held fixed.
     _run_weight_scale_calibration(model, forward_loop, scale_algorithm or {"method": "max"})
+    if torch.cuda.is_available():
+        # Scale searches can leave large temporary blocks in the caching allocator.
+        # GPTQ's activation replay and Hessian collection do not reuse those blocks.
+        torch.cuda.empty_cache()
 
     quantized_layers = [
         (n, m)
@@ -2306,7 +2324,13 @@ def gptq(
             cls = GPTQHelper
         else:
             cls = _GPTQ_HELPER_REGISTRY.get(backend, GPTQHelper)
-        return cls(m, name, offload_to_cpu=True, fused=fused)
+        return cls(
+            m,
+            name,
+            offload_to_cpu=True,
+            fused=fused,
+            hessian_storage_device=hessian_storage_device,
+        )
 
     gptq_handles = {name: _make_gptq_handle(name, m) for name, m in quantized_layers}
     gptq_handles.update(
@@ -2320,6 +2344,7 @@ def gptq(
                 input_quantizer,
                 offload_to_cpu=True,
                 fused=fused,
+                hessian_storage_device=hessian_storage_device,
             )
             for name, module, weight_name, expert_idx, quantizer, input_quantizer in fused_expert_weights
         }

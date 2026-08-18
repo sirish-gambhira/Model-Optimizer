@@ -231,6 +231,7 @@ def wrapped_calib_func(
     layerwise = layerwise_cfg.get("enable", False)
     checkpoint_dir = layerwise_cfg.get("checkpoint_dir")
     qdq_from_prev = layerwise_cfg.get("get_qdq_activations_from_prev_layer", False)
+    offload_activations_to_cpu = layerwise_cfg.get("offload_activations_to_cpu", False)
     save_every = layerwise_cfg.get("save_every", 1)
     calib_mutates_weights = layerwise_cfg.get("calib_mutates_weights", True)
     if method is not None and "awq" in method:
@@ -266,6 +267,7 @@ def wrapped_calib_func(
                 calib_func=func,
                 checkpoint_dir=checkpoint_dir,
                 get_qdq_activations_from_prev_layer=qdq_from_prev,
+                offload_activations_to_cpu=offload_activations_to_cpu,
                 save_every=save_every,
                 calib_mutates_weights=calib_mutates_weights,
                 **kwargs,

@@ -18,6 +18,7 @@
 import torch
 
 from modelopt.torch.quantization.utils.calib_utils import (
+    GPTQHelper,
     compute_hessian_inverse,
     update_hessian,
 )
@@ -120,6 +121,14 @@ def test_update_hessian_zero_token_input_noops():
     assert updated_hessian is hessian
     assert new_n_samples == n_samples
     torch.testing.assert_close(hessian, expected_hessian)
+
+
+def test_gptq_helper_explicit_cpu_hessian_storage():
+    module = torch.nn.Linear(4, 3, bias=False)
+    helper = GPTQHelper(module, "linear", hessian_storage_device="cpu")
+
+    assert helper.hessian.device.type == "cpu"
+    assert helper.hessian.shape == (4, 4)
 
 
 def test_compute_hessian_inverse_zeros_hessian_dead_weight_columns():

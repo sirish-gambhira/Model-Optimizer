@@ -150,15 +150,29 @@ class GPTQHelper:
 
     CACHE_NAME = "_forward_no_gptq_hessian"
 
-    def __init__(self, module, name, offload_to_cpu=False, fused=False):
+    def __init__(
+        self,
+        module,
+        name,
+        offload_to_cpu=False,
+        fused=False,
+        hessian_storage_device="auto",
+    ):
         """Initialize GPTQHelper with module state and Hessian storage."""
         self.module = module
         self.name = name
         self.fused = fused
         in_features = module.weight.shape[-1]
         device = module.weight.device
-        if device.type == "meta" or (offload_to_cpu and get_used_gpu_mem_fraction(device) > 0.65):
+        if hessian_storage_device == "cpu" or (hessian_storage_device == "auto" and (
+            device.type == "meta"
+            or (offload_to_cpu and get_used_gpu_mem_fraction(device) > 0.65)
+        )):
             device = "cpu"
+        elif hessian_storage_device not in ("auto", "current"):
+            raise ValueError(
+                "hessian_storage_device must be one of 'auto', 'current', or 'cpu'"
+            )
         self.hessian = torch.zeros(in_features, in_features, dtype=torch.float32, device=device)
         self.n_samples = 0
         # Set by update_weights(); listed here for documentation.
@@ -437,6 +451,7 @@ class FusedExpertGPTQHelper(GPTQHelper):
         input_quantizer,
         offload_to_cpu=False,
         fused=False,
+        hessian_storage_device="auto",
     ):
         """Initialize one helper for a fused parameter's expert slice."""
         self.module = module
@@ -448,8 +463,15 @@ class FusedExpertGPTQHelper(GPTQHelper):
         self.fused = fused
         weight = self._weight_slice()
         device = weight.device
-        if device.type == "meta" or (offload_to_cpu and get_used_gpu_mem_fraction(device) > 0.65):
+        if hessian_storage_device == "cpu" or (hessian_storage_device == "auto" and (
+            device.type == "meta"
+            or (offload_to_cpu and get_used_gpu_mem_fraction(device) > 0.65)
+        )):
             device = "cpu"
+        elif hessian_storage_device not in ("auto", "current"):
+            raise ValueError(
+                "hessian_storage_device must be one of 'auto', 'current', or 'cpu'"
+            )
         self.hessian = torch.zeros(
             weight.shape[-1], weight.shape[-1], dtype=torch.float32, device=device
         )
