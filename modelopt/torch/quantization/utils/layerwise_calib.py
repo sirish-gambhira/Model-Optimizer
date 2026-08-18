@@ -130,13 +130,19 @@ class LayerActivationCollector:
     _decoder_layer_support: list[tuple[Any, Any]] = []
     _LAYER_ATTR = "_layerwise_calib"
 
-    def __init__(self, model: nn.Module, status_callback: Callable[[str], None] | None = None):
+    def __init__(
+        self,
+        model: nn.Module,
+        status_callback: Callable[[str], None] | None = None,
+        offload_activations_to_cpu: bool = False,
+    ):
         """Initialize the collector for the given model."""
         self.model = model
         self._decoder_layers: nn.ModuleList | None = None
         self._layer_to_idx: dict[nn.Module, int] = {}
         self._patched = False
         self._status_callback = status_callback
+        self.offload_activations_to_cpu = offload_activations_to_cpu
 
     def _swap_to_dummy(self, idx: int):
         """Replace decoder layer *idx* with a parameter-free dummy.
@@ -218,6 +224,7 @@ class LayerActivationCollector:
             decoder_layers: Pre-resolved decoder layers. If *None*, layers are
                 discovered via :meth:`get_decoder_layers`.
         """
+        offload_activations_to_cpu = self.offload_activations_to_cpu
 
         def _patched_forward(self, *args, **kwargs):
             info: _LayerCalibState = self._layerwise_calib
@@ -236,12 +243,23 @@ class LayerActivationCollector:
                     f"Layer {info.name} is in 'run' mode but has no cached inputs to replay."
                 )
                 real_args, real_kwargs = info.cached_inputs.popleft()
+                if offload_activations_to_cpu:
+                    device = get_module_device(self)
+                    real_args = _move_to_device(real_args, device)
+                    real_kwargs = _move_to_device(real_kwargs, device)
                 output = self._original_forward(*real_args, **real_kwargs)
                 info.output_meta = LayerActivationCollector._extract_output_meta(output)
                 return output
 
             if info.mode == "capture":
-                info.collected_inputs.append((args, kwargs))
+                captured = (args, kwargs)
+                if offload_activations_to_cpu:
+                    if kwargs.get("past_key_values") is not None:
+                        kwargs = dict(kwargs)
+                        kwargs["past_key_values"] = None
+                        captured = (args, kwargs)
+                    captured = _move_to_device(captured, torch.device("cpu"))
+                info.collected_inputs.append(captured)
                 raise _EarlyStopForwardError()
 
             return self._original_forward(*args, **kwargs)

@@ -288,22 +288,20 @@ def static_blockwise_fp4_fake_quant(
     if out_dtype is None:
         out_dtype = x.dtype
 
-    scale = compute_fp4_scales(
-        amax,
-        global_amax,
-        quantize_block_scales,
-        fp8_max_for_normalization=fp8_max_for_normalization,
-    )
-
-    x_flat = x.contiguous().view(-1)
-    y_flat = torch.empty_like(x_flat, dtype=out_dtype)
-    scale_flat = scale.contiguous().view(NUM_FP4_BLOCKS)
-
-    tl_out_dtype = _torch_dtype_to_tl(out_dtype)
-
-    grid = (NUM_FP4_BLOCKS,)
-
     with torch.cuda.device(x.device):
+        scale = compute_fp4_scales(
+            amax,
+            global_amax,
+            quantize_block_scales,
+            fp8_max_for_normalization=fp8_max_for_normalization,
+        )
+
+        x_flat = x.contiguous().view(-1)
+        y_flat = torch.empty_like(x_flat, dtype=out_dtype)
+        scale_flat = scale.contiguous().view(NUM_FP4_BLOCKS)
+
+        tl_out_dtype = _torch_dtype_to_tl(out_dtype)
+        grid = (NUM_FP4_BLOCKS,)
         static_blockwise_fp4_fake_quant_kernel[grid](
             x_flat,
             y_flat,

@@ -17,6 +17,7 @@
 
 import fnmatch
 import math
+import pathlib
 import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -34,12 +35,17 @@ from modelopt.torch.opt.searcher import ForwardLoop
 from modelopt.torch.quantization.utils.layerwise_calib import (
     LayerActivationCollector,
     _CheckpointState,
+    _move_to_device,
 )
 from modelopt.torch.utils import print_rank_0, warn_rank_0
 from modelopt.torch.utils.distributed import DistributedProcessGroup, ParallelState, is_master
 from modelopt.torch.utils.distributed import is_initialized as dist_is_initialized
 from modelopt.torch.utils.distributed import size as dist_size
-from modelopt.torch.utils.network import bind_forward_method, unpatch_forward_method
+from modelopt.torch.utils.network import (
+    bind_forward_method,
+    get_module_device,
+    unpatch_forward_method,
+)
 
 from .calib import MseCalibrator, NVFP4ActHeadroomCalibrator, NVFP4MSECalibrator, _Calibrator
 from .conversion import create_and_replace_svdquant_linear_on_the_fly, set_quantizer_by_cfg_context
@@ -64,7 +70,7 @@ from .utils import (
     persistent_materialization,
     promote_static_block_weight_quantizers,
 )
-from .utils.calib_utils import _GPTQ_HELPER_REGISTRY, GPTQHelper
+from .utils.calib_utils import _GPTQ_HELPER_REGISTRY, FusedExpertGPTQHelper, GPTQHelper
 
 __all__ = [
     "CalibratorFactory",
@@ -2071,6 +2077,7 @@ def layerwise_calibrate(
     """
     checkpoint_dir = calib_kwargs.pop("checkpoint_dir", None)
     qdq_from_prev = calib_kwargs.pop("get_qdq_activations_from_prev_layer", False)
+    offload_activations_to_cpu = calib_kwargs.pop("offload_activations_to_cpu", False)
     save_every = calib_kwargs.pop("save_every", 1)
     calib_mutates_weights = calib_kwargs.pop("calib_mutates_weights", True)
 
@@ -2109,7 +2116,11 @@ def layerwise_calibrate(
     def _set_layer_status(status: str):
         layer_pbar.set_postfix_str(status, refresh=True)
 
-    input_getter = LayerActivationCollector(model, status_callback=_set_layer_status)
+    input_getter = LayerActivationCollector(
+        model,
+        status_callback=_set_layer_status,
+        offload_activations_to_cpu=offload_activations_to_cpu,
+    )
 
     try:
         input_getter._patch_all_layers(decoder_layers=transformer_layers)
@@ -2125,6 +2136,10 @@ def layerwise_calibrate(
 
             def _layer_forward_loop(m, _inputs=layer_inputs):
                 for args, kwargs_input in _inputs:
+                    if offload_activations_to_cpu:
+                        device = get_module_device(m)
+                        args = _move_to_device(args, device)
+                        kwargs_input = _move_to_device(kwargs_input, device)
                     # Reset past_key_values to prevent the KV cache from
                     # accumulating across multiple forward replays (e.g.
                     # max_calibrate then Hessian collection in GPTQ).
@@ -2135,11 +2150,7 @@ def layerwise_calibrate(
                         and kwargs_input["past_key_values"] is not None
                     ):
                         kwargs_input = dict(kwargs_input)
-                        cache = kwargs_input["past_key_values"]
-                        if hasattr(cache, "reset"):
-                            cache.reset()
-                        else:
-                            kwargs_input["past_key_values"] = None
+                        kwargs_input["past_key_values"] = None
                     m(*args, **kwargs_input)
 
             is_last = layer_idx + 1 >= num_layers
@@ -2194,7 +2205,17 @@ def gptq(
     forward_loop: ForwardLoop,
     perc_damp: float = 0.01,
     block_size: int = 128,
+    module_patterns: list[str] | None = None,
     fused: bool = False,
+    block_scale_update: str = "static",
+    dynamic_scale_candidates: int = 8,
+    hessian_inverse_device: str = "current",
+    hessian_inverse_dtype: str = "float32",
+    hessian_storage_device: str = "auto",
+    hessian_diagnostic_dir: str | None = None,
+    hessian_diagnostic_only: bool = False,
+    scale_algorithm: dict | None = None,
+    rtn_fallback: dict | None = None,
 ):
     """GPTQ quantization.
 
@@ -2208,11 +2229,12 @@ def gptq(
 
     Per-module steps:
 
-    1. ``max_calibrate`` to set amax values from the current activations.
+    1. ``scale_algorithm`` sets the weight amax values (default ``max``).
     2. Promote eligible quantizers to ``StaticBlockScaleQuantizer`` (two-level scaling).
     3. Collect per-linear-layer Hessian matrices via forward hooks.
     4. Blockwise weight updates using the inverse Hessian to compensate for
-       rounding error (the core GPTQ column-wise update).
+       rounding error (the core GPTQ column-wise update), unless the optional
+       sample-count gate retains scale-only RTN for that module.
 
     Args:
         model: The module to quantize — either the full model or a single decoder
@@ -2220,19 +2242,79 @@ def gptq(
         forward_loop: Callable that replays calibration inputs through *model*.
         perc_damp: Percentage of avg Hessian diagonal for damping (default: 0.01).
         block_size: Block size for GPTQ weight update.
+        module_patterns: Optional fnmatch-style patterns restricting Hessian collection and
+            GPTQ updates to matching quantized linears. Non-matching quantizers remain enabled
+            during calibration forwards, but GPTQ does not mutate their weights.
         fused: If True, use fused Triton kernel for NVFP4 static quantization.
+        block_scale_update: ``'static'`` freezes the scale grid selected before GPTQ.
+            ``'dynamic_mse'`` keeps the global NVFP4 scale fixed but reselects each
+            per-16 E4M3 scale from the evolving GPTQ working weights.
+        dynamic_scale_candidates: Number of neighboring E4M3 values searched by
+            ``dynamic_mse``. Eight matches GPTQModel; 126 is exhaustive.
+        hessian_inverse_device: Device for the dense Hessian factorization. ``'current'``
+            uses the weight device; ``'cpu'`` factorizes on CPU and copies the resulting
+            upper-Cholesky inverse factor back to the weight device.
+        hessian_storage_device: Device used to accumulate Hessians. ``'auto'`` uses the
+            existing memory-pressure heuristic, ``'current'`` keeps them beside the
+            weights, and ``'cpu'`` always stores them in host memory.
+        hessian_diagnostic_dir: Optional directory for raw per-module Hessian snapshots.
+        hessian_diagnostic_only: Save Hessians and skip inversion and GPTQ weight updates.
+        scale_algorithm: Weight-scale calibration run before the update, as a dict with a
+            'method' key ('max', 'mse' or 'local_hessian'). Defaults to ``{'method': 'max'}``.
+            The scales are frozen before the column-wise update, so for block-scaled
+            formats (NVFP4) this choice bounds what the weight update can recover.
+        rtn_fallback: Optional sample-count gate. A matching module skips the GPTQ update when
+            ``n_samples < min_samples_per_input_dim * in_features`` and therefore uses RTN on
+            the grid already selected by ``scale_algorithm``. ``module_patterns`` optionally
+            limits eligibility with fnmatch-style module-name patterns. Matching modules also
+            report their GPTQ objective relative to RTN without using it as an acceptance gate.
     """
     total_start = time.time()
 
-    # TODO: Add support for other scale setting strateiges like weight-mse or local-hessian
-    max_calibrate(model, forward_loop=forward_loop)
+    # The scales GPTQ optimizes against are set here and then held fixed.
+    _run_weight_scale_calibration(model, forward_loop, scale_algorithm or {"method": "max"})
+    if torch.cuda.is_available():
+        # Scale searches can leave large temporary blocks in the caching allocator.
+        # GPTQ's activation replay and Hessian collection do not reuse those blocks.
+        torch.cuda.empty_cache()
 
     quantized_layers = [
         (n, m)
         for n, m in model.named_modules()
-        if is_quantized_linear(m) and m.weight_quantizer.is_enabled
+        if is_quantized_linear(m)
+        and m.weight_quantizer.is_enabled
+        and (
+            module_patterns is None
+            or any(fnmatch.fnmatch(n, pattern) for pattern in module_patterns)
+        )
     ]
-    if not quantized_layers:
+    fused_expert_weights = []
+    for module_name, module in model.named_modules():
+        if not _is_quant_fused_experts(module):
+            continue
+        first_proj_attr = getattr(module, "_first_proj_attr", "gate_up_proj")
+        for weight_name, quantizers_name, input_quantizer_name in (
+            (
+                first_proj_attr,
+                f"{first_proj_attr}_weight_quantizers",
+                f"{first_proj_attr}_input_quantizer",
+            ),
+            ("down_proj", "down_proj_weight_quantizers", "down_proj_input_quantizer"),
+        ):
+            quantizers = getattr(module, quantizers_name)
+            input_quantizer = getattr(module, input_quantizer_name)
+            for expert_idx, quantizer in enumerate(quantizers):
+                name = f"{module_name}.{weight_name}.{expert_idx}"
+                if not quantizer.is_enabled or (
+                    module_patterns is not None
+                    and not any(fnmatch.fnmatch(name, pattern) for pattern in module_patterns)
+                ):
+                    continue
+                fused_expert_weights.append(
+                    (name, module, weight_name, expert_idx, quantizer, input_quantizer)
+                )
+
+    if not quantized_layers and not fused_expert_weights:
         print_rank_0("No quantized linear layers found, skipping GPTQ")
         return
 
@@ -2242,9 +2324,31 @@ def gptq(
             cls = GPTQHelper
         else:
             cls = _GPTQ_HELPER_REGISTRY.get(backend, GPTQHelper)
-        return cls(m, name, offload_to_cpu=True, fused=fused)
+        return cls(
+            m,
+            name,
+            offload_to_cpu=True,
+            fused=fused,
+            hessian_storage_device=hessian_storage_device,
+        )
 
     gptq_handles = {name: _make_gptq_handle(name, m) for name, m in quantized_layers}
+    gptq_handles.update(
+        {
+            name: FusedExpertGPTQHelper(
+                module,
+                name,
+                weight_name,
+                expert_idx,
+                quantizer,
+                input_quantizer,
+                offload_to_cpu=True,
+                fused=fused,
+                hessian_storage_device=hessian_storage_device,
+            )
+            for name, module, weight_name, expert_idx, quantizer, input_quantizer in fused_expert_weights
+        }
+    )
     for handle in gptq_handles.values():
         handle.setup()
 
@@ -2258,13 +2362,107 @@ def gptq(
     for handle in gptq_handles.values():
         handle.cleanup()
 
+    if hessian_diagnostic_only and hessian_diagnostic_dir is None:
+        raise ValueError("hessian_diagnostic_only requires hessian_diagnostic_dir")
+    if hessian_diagnostic_dir is not None:
+        diagnostic_dir = pathlib.Path(hessian_diagnostic_dir)
+        diagnostic_dir.mkdir(parents=True, exist_ok=True)
+        for name, handle in gptq_handles.items():
+            stem = name.replace(".", "_").replace("/", "_")
+            path = diagnostic_dir / f"{stem}.pt"
+            index = 1
+            while path.exists():
+                path = diagnostic_dir / f"{stem}.{index}.pt"
+                index += 1
+            torch.save(
+                {
+                    "name": name,
+                    "n_samples": handle.n_samples,
+                    "hessian": handle.hessian.cpu(),
+                },
+                path,
+            )
+            print_rank_0(f"[{name}] saved Hessian diagnostic to {path}")
+    if hessian_diagnostic_only:
+        for handle in gptq_handles.values():
+            handle.free()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print_rank_0(f"GPTQ diagnostic-only time: {time.time() - total_start:.2f}s")
+        return
+
+    fallback_ratio = None
+    fallback_patterns = None
+    if rtn_fallback is not None:
+        fallback_ratio = rtn_fallback["min_samples_per_input_dim"]
+        fallback_patterns = rtn_fallback.get("module_patterns")
+
     print_rank_0("Updating weights using GPTQ algorithm...")
     name_to_module = dict(model.named_modules())
-    for handle in gptq_handles.values():
-        with enable_weight_access_and_writeback(handle.module, model, name_to_module):
-            handle.update_weights(block_size, perc_damp)
+    sample_fallback_count = 0
+    hessian_fallback_count = 0
+    for name, handle in gptq_handles.items():
+        input_dim = handle.hessian.shape[0]
+        pattern_match = fallback_patterns is None or any(
+            fnmatch.fnmatch(name, pattern) for pattern in fallback_patterns
+        )
+        required_samples = (
+            math.ceil(fallback_ratio * input_dim)
+            if fallback_ratio is not None and pattern_match
+            else None
+        )
+        use_rtn = required_samples is not None and handle.n_samples < required_samples
+        stats = {
+            "n_samples": handle.n_samples,
+            "input_dim": input_dim,
+            "required_samples": required_samples,
+            "eligible": not use_rtn,
+            "action": "rtn_fallback" if use_rtn else "gptq",
+        }
+        if use_rtn:
+            sample_fallback_count += 1
+            print_rank_0(
+                f"[{name}] GPTQ skipped: {handle.n_samples} Hessian samples < "
+                f"{required_samples} required; retaining A2 RTN"
+            )
+        else:
+            with enable_weight_access_and_writeback(handle.module, model, name_to_module):
+                metrics = handle.update_weights(
+                    block_size,
+                    perc_damp,
+                    compare_vs_rtn=rtn_fallback is not None and pattern_match,
+                    block_scale_update=block_scale_update,
+                    dynamic_scale_candidates=dynamic_scale_candidates,
+                    hessian_inverse_device=hessian_inverse_device,
+                    hessian_inverse_dtype=hessian_inverse_dtype,
+                )
+            stats.update(metrics)
+            if metrics.get("fallback_reason") == "hessian_factorization":
+                stats["action"] = "rtn_hessian_fallback"
+                hessian_fallback_count += 1
+                print_rank_0(
+                    f"[{name}] GPTQ reconstruction loss: not computed "
+                    "(Hessian factorization failed); retaining A2 RTN"
+                )
+        if isinstance(handle, FusedExpertGPTQHelper):
+            handle.module._gptq_calibration_stats_by_name = getattr(
+                handle.module, "_gptq_calibration_stats_by_name", {}
+            )
+            handle.module._gptq_calibration_stats_by_name[name] = stats
+        else:
+            handle.module._gptq_calibration_stats = stats
         handle.free()
+    handle_count = len(gptq_handles)
     del gptq_handles
+
+    if fallback_ratio is not None:
+        fallback_count = sample_fallback_count + hessian_fallback_count
+        print_rank_0(
+            f"GPTQ RTN fallback: {fallback_count}/{handle_count} modules retained "
+            f"scale-only RTN (sample={sample_fallback_count}, "
+            f"hessian={hessian_fallback_count}, "
+            f"min_samples_per_input_dim={fallback_ratio})."
+        )
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

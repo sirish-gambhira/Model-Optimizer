@@ -202,6 +202,32 @@ class Testfp4:
 
         assert torch.equal(output, torch.zeros_like(output))
 
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 2,
+        reason="device-context regression requires two CUDA devices",
+    )
+    @pytest.mark.skipif(not triton_kernel.IS_AVAILABLE, reason="triton kernel is not available")
+    def test_static_blockwise_fp4_uses_input_device_context(self):
+        input_device = torch.device("cuda:1")
+        x = torch.full((6144, 16), -0.0310935732, device=input_device)
+        amax = torch.full((6144, 1), 0.0468750037, device=input_device)
+        global_amax = torch.tensor(0.21875, device=input_device)
+
+        with torch.cuda.device(input_device):
+            expected = triton_kernel.static_blockwise_fp4_fake_quant(
+                x, amax, global_amax
+            )
+
+        # The caller's current device may differ under Accelerate's multi-GPU
+        # layerwise calibration. Scale computation and QDQ must still execute
+        # on the input tensor's device.
+        with torch.cuda.device(0):
+            for _ in range(32):
+                actual = triton_kernel.static_blockwise_fp4_fake_quant(
+                    x, amax, global_amax
+                )
+                assert torch.equal(actual, expected)
+
     @pytest.mark.skipif(get_cuda_ext_mx() is None, reason="cuda_ext_mx is not available")
     @pytest.mark.parametrize(
         "set_torch_dtype", [torch.float, torch.float16, torch.bfloat16], indirect=True

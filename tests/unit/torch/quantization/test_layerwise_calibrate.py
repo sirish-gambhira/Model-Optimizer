@@ -26,6 +26,7 @@ import torch.nn as nn
 import modelopt.torch.quantization as mtq
 from modelopt.torch.quantization.model_calib import layerwise_calibrate
 from modelopt.torch.quantization.nn import TensorQuantizer
+from modelopt.torch.quantization.utils import layerwise_calib as layerwise_calib_utils
 from modelopt.torch.quantization.utils.layerwise_calib import LayerActivationCollector, _SkipLayer
 
 
@@ -144,6 +145,31 @@ def test_collector_activations_match_expected(monkeypatch):
         inputs = collector.get_input_activations(model.layers[0], forward_loop)
         args, kwargs = inputs[0]
         assert torch.allclose(args[0], data[0])
+    finally:
+        collector._unpatch_all_layers()
+
+
+def test_collector_cpu_offload_moves_capture_and_replay(monkeypatch):
+    _register_test_discoverer(monkeypatch)
+    model = _SimpleTwoLayerModel(dim=8)
+    x = torch.randn(2, 8)
+    moves = []
+    real_move = layerwise_calib_utils._move_to_device
+
+    def record_move(obj, device):
+        moves.append(torch.device(device))
+        return real_move(obj, device)
+
+    monkeypatch.setattr(layerwise_calib_utils, "_move_to_device", record_move)
+    collector = LayerActivationCollector(model, offload_activations_to_cpu=True)
+
+    collector._patch_all_layers()
+    try:
+        first_inputs = collector.get_input_activations(model.layers[0], lambda m: m(x))
+        assert first_inputs[0][0][0].device.type == "cpu"
+        collector.get_input_activations(model.layers[1], lambda m: m(x))
+        assert moves
+        assert all(device.type == "cpu" for device in moves)
     finally:
         collector._unpatch_all_layers()
 

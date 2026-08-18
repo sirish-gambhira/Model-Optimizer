@@ -740,6 +740,16 @@ class LayerwiseConfig(ModeloptBaseConfig):
         ),
     )
 
+    offload_activations_to_cpu: bool = ModeloptField(
+        default=False,
+        title="Store cached layer inputs in CPU memory.",
+        description=(
+            "If True, move layer-input activation caches to CPU after capture and "
+            "copy each replay batch back to the calibrated layer's device. This "
+            "reduces persistent GPU memory at the cost of host-device transfers."
+        ),
+    )
+
     checkpoint_dir: str | None = ModeloptField(
         default=None,
         title="Per-layer checkpoint directory (resume on restart).",
@@ -1249,6 +1259,27 @@ class SVDQuantConfig(QuantizeAlgorithmConfig):
     )
 
 
+class GPTQRtnFallbackConfig(ModeloptBaseConfig):
+    """Use scale-only RTN when GPTQ is under-sampled."""
+
+    min_samples_per_input_dim: float = ModeloptField(
+        default=1.0,
+        gt=0.0,
+        title="Minimum Hessian samples per input dimension",
+        description=(
+            "A matched module skips the GPTQ weight update when its collected activation "
+            "sample count is below this multiple of its input dimension. Its weights remain "
+            "unchanged and are quantized by RTN using the grid selected by scale_algorithm."
+        ),
+    )
+    module_patterns: list[str] | None = ModeloptField(
+        default=None,
+        title="Module-name wildcard patterns eligible for RTN fallback",
+        description=(
+            "Optional fnmatch-style module-name patterns. If omitted, every GPTQ module is "
+            "eligible. Use a routed-expert pattern to leave dense and shared modules unchanged."
+        ),
+    )
 class GPTQCalibConfig(QuantizeAlgorithmConfig):
     """The config for GPTQ quantization.
 
@@ -1275,11 +1306,103 @@ class GPTQCalibConfig(QuantizeAlgorithmConfig):
         description="""The block size for GPTQ weight update, which must be a multiple of the
         group_size used in the quantization.""",
     )
+    module_patterns: list[str] | None = ModeloptField(
+        default=None,
+        title="Module-name wildcard patterns updated by GPTQ",
+        description=(
+            "Optional fnmatch-style patterns restricting Hessian collection and GPTQ weight "
+            "updates to matching quantized linears. Other enabled quantizers remain active "
+            "during calibration forwards but their weights are not updated by GPTQ."
+        ),
+    )
     fused: bool = ModeloptField(
         default=False,
         title="Use fused Triton kernel for GPTQ.",
         description="""When True, use a fused Triton kernel that combines quantization and
         per-column error propagation into one launch per GPTQ block.""",
+    )
+    block_scale_update: Literal["static", "dynamic_mse"] = ModeloptField(
+        default="static",
+        title="NVFP4 per-block scale update policy during GPTQ",
+        description=(
+            "'static' freezes the pre-calibrated block scales. 'dynamic_mse' keeps the "
+            "global scale fixed but reselects each 16-wide E4M3 block scale from GPTQ's "
+            "current error-propagated working weights when that block is reached."
+        ),
+    )
+    dynamic_scale_candidates: int = ModeloptField(
+        default=8,
+        ge=2,
+        le=126,
+        title="Number of neighboring E4M3 candidates for dynamic block-scale search",
+        description=(
+            "Candidate count used by dynamic_mse. Eight matches GPTQModel's local search; "
+            "126 exhaustively searches every positive finite E4M3 scale."
+        ),
+    )
+    hessian_inverse_device: Literal["current", "cpu"] = ModeloptField(
+        default="current",
+        title="Device used for GPTQ Hessian factorization",
+        description=(
+            "'current' factorizes on the weight device. 'cpu' performs the two Cholesky "
+            "factorizations and inverse on CPU, then copies the resulting factor back to "
+            "the weight device. This is useful when a CUDA solver is not recoverable."
+        ),
+    )
+    hessian_inverse_dtype: Literal["float32", "float64"] = ModeloptField(
+        default="float32",
+        title="Dtype used for GPTQ Hessian factorization",
+        description=(
+            "Factorize the dense damped Hessian in float32 or float64. The resulting "
+            "inverse-Cholesky factor is converted back to the working-weight dtype."
+        ),
+    )
+    hessian_storage_device: Literal["auto", "current", "cpu"] = ModeloptField(
+        default="auto",
+        title="Device used to accumulate GPTQ Hessians",
+        description=(
+            "'auto' moves Hessians to CPU once their weight device exceeds the memory "
+            "threshold. 'current' always accumulates beside the weight. 'cpu' always "
+            "accumulates in host memory before factorization."
+        ),
+    )
+    hessian_diagnostic_dir: str | None = ModeloptField(
+        default=None,
+        title="Directory for raw GPTQ Hessian diagnostics",
+        description=(
+            "Optional directory where each collected GPTQ Hessian and its sample count are "
+            "saved before inversion. Intended for targeted numerical diagnostics."
+        ),
+    )
+    hessian_diagnostic_only: bool = ModeloptField(
+        default=False,
+        title="Stop GPTQ after writing Hessian diagnostics",
+        description=(
+            "When true, collect and save selected Hessians but skip inverse-Hessian and weight "
+            "updates. Requires hessian_diagnostic_dir."
+        ),
+    )
+    scale_algorithm: dict | None = ModeloptField(
+        default=None,
+        title="Weight-scale calibration algorithm run before the GPTQ update.",
+        description="""Which algorithm sets the weight quantization scales that GPTQ then
+        optimizes against. Dict with a 'method' key: 'max' (amax/Q_max), 'mse' (per-block
+        error-minimizing search) or 'local_hessian'. Defaults to ``{'method': 'max'}``,
+        which preserves historical GPTQ behaviour.
+
+        This matters for block-scaled formats such as NVFP4: the per-block scales are
+        frozen before the column-wise update, so a weaker scale rule caps what the weight
+            update can achieve regardless of how good that update is.""",
+    )
+    rtn_fallback: GPTQRtnFallbackConfig | None = ModeloptField(
+        default=None,
+        title="RTN fallback",
+        description=(
+            "Optional fallback for modules whose collected Hessian has fewer activation "
+            "samples than a configured multiple of its input dimension. Matching modules "
+            "retain their original weights and use RTN on the scale_algorithm grid. An "
+            "optional post-update MSE guard can also reject GPTQ candidates worse than RTN."
+        ),
     )
 
     @model_validator(mode="after")

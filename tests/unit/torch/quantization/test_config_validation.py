@@ -687,11 +687,36 @@ class TestLayerwiseNestedConfig:
         cfg = GPTQCalibConfig(layerwise=layerwise_input)
         assert cfg.layerwise.get_qdq_activations_from_prev_layer is expected_qdq
 
+    def test_gptq_rtn_fallback_config(self):
+        cfg = GPTQCalibConfig(
+            module_patterns=["*experts*"],
+            rtn_fallback={
+                "min_samples_per_input_dim": 2.0,
+                "module_patterns": ["*experts*"],
+            },
+        )
+        assert cfg.module_patterns == ["*experts*"]
+        assert cfg.rtn_fallback.min_samples_per_input_dim == 2.0
+        assert cfg.rtn_fallback.module_patterns == ["*experts*"]
+
+    def test_gptq_rtn_fallback_ratio_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            GPTQCalibConfig(rtn_fallback={"min_samples_per_input_dim": 0.0})
+
+    def test_gptq_cpu_memory_controls(self):
+        cfg = GPTQCalibConfig(
+            hessian_storage_device="cpu",
+            layerwise={"enable": True, "offload_activations_to_cpu": True},
+        )
+        assert cfg.hessian_storage_device == "cpu"
+        assert cfg.layerwise.offload_activations_to_cpu is True
+
     def test_default_dump_shape(self):
         dumped = MaxCalibConfig().model_dump()
         assert dumped["layerwise"] == {
             "enable": False,
             "get_qdq_activations_from_prev_layer": False,
+            "offload_activations_to_cpu": False,
             "checkpoint_dir": None,
             "save_every": 1,
             "calib_mutates_weights": True,
