@@ -2271,8 +2271,17 @@ def gptq(
     """
     total_start = time.time()
 
+    from modelopt.torch.quantization.utils.calib_utils import (
+        GPTQ_PHASE_TIMES,
+        finalize_hessian,
+    )
+
+    GPTQ_PHASE_TIMES.clear()
+
     # The scales GPTQ optimizes against are set here and then held fixed.
+    scale_calib_start = time.time()
     _run_weight_scale_calibration(model, forward_loop, scale_algorithm or {"method": "max"})
+    scale_calib_seconds = time.time() - scale_calib_start
     if torch.cuda.is_available():
         # Scale searches can leave large temporary blocks in the caching allocator.
         # GPTQ's activation replay and Hessian collection do not reuse those blocks.
@@ -2352,8 +2361,14 @@ def gptq(
     for handle in gptq_handles.values():
         handle.setup()
 
+    storage_devices: dict[str, int] = {}
+    for handle in gptq_handles.values():
+        key = str(handle.hessian.device)
+        storage_devices[key] = storage_devices.get(key, 0) + 1
+    print_rank_0(f"GPTQ Hessian storage devices: {storage_devices}")
     print_rank_0(f"Computing Hessians for {len(gptq_handles)} linear layers...")
 
+    hessian_collect_start = time.time()
     with set_quantizer_by_cfg_context(
         model, [{"quantizer_name": "*weight_quantizer", "enable": False}]
     ):
@@ -2361,6 +2376,9 @@ def gptq(
 
     for handle in gptq_handles.values():
         handle.cleanup()
+    for handle in gptq_handles.values():
+        finalize_hessian(handle.hessian, handle.n_samples)
+    hessian_collect_seconds = time.time() - hessian_collect_start
 
     if hessian_diagnostic_only and hessian_diagnostic_dir is None:
         raise ValueError("hessian_diagnostic_only requires hessian_diagnostic_dir")
@@ -2398,6 +2416,7 @@ def gptq(
         fallback_patterns = rtn_fallback.get("module_patterns")
 
     print_rank_0("Updating weights using GPTQ algorithm...")
+    update_loop_start = time.time()
     name_to_module = dict(model.named_modules())
     sample_fallback_count = 0
     hessian_fallback_count = 0
@@ -2426,6 +2445,7 @@ def gptq(
                 f"{required_samples} required; retaining A2 RTN"
             )
         else:
+            update_start = time.time()
             with enable_weight_access_and_writeback(handle.module, model, name_to_module):
                 metrics = handle.update_weights(
                     block_size,
@@ -2436,6 +2456,7 @@ def gptq(
                     hessian_inverse_device=hessian_inverse_device,
                     hessian_inverse_dtype=hessian_inverse_dtype,
                 )
+            metrics["update_seconds"] = round(time.time() - update_start, 3)
             stats.update(metrics)
             if metrics.get("fallback_reason") == "hessian_factorization":
                 stats["action"] = "rtn_hessian_fallback"
@@ -2466,6 +2487,18 @@ def gptq(
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    update_loop_seconds = time.time() - update_loop_start
+    phases = dict(GPTQ_PHASE_TIMES)
+    accounted = sum(phases.values())
+    phase_text = ", ".join(
+        f"{k}={v:.1f}s" for k, v in sorted(phases.items(), key=lambda kv: -kv[1])
+    )
+    print_rank_0(
+        f"GPTQ phase breakdown: scale_calib={scale_calib_seconds:.1f}s, "
+        f"hessian_collect={hessian_collect_seconds:.1f}s, "
+        f"update_loop={update_loop_seconds:.1f}s "
+        f"({phase_text}, other={update_loop_seconds - accounted:.1f}s)"
+    )
     print_rank_0(f"GPTQ time: {time.time() - total_start:.2f}s")
 
 

@@ -38,8 +38,11 @@
 
 """GPTQ helper and Hessian utilities for calibration."""
 
+import collections
+import contextlib
 import math
 import os
+import time
 
 import torch
 
@@ -47,35 +50,76 @@ from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.network import bind_forward_method, unpatch_forward_method
 from modelopt.torch.utils.perf import get_used_gpu_mem_fraction
 
+# Token count at which a GPTQ helper flushes its buffered input chunks into the
+# Hessian. MoE experts receive ~tokens/num_experts-sized chunks per calibration
+# window, and updating the full in_features^2 Hessian per chunk makes collection
+# O(windows x experts x in_features^2) memory traffic (PCIe-bound when the
+# Hessian is CPU-stored). Buffering decouples Hessian-update frequency from
+# chunk size; the accumulated value is unchanged up to fp summation order.
+GPTQ_HESSIAN_FLUSH_TOKENS = int(os.environ.get("MODELOPT_GPTQ_HESSIAN_FLUSH_TOKENS", "4096"))
+
+# Wall-clock totals per GPTQ phase, accumulated across update_weights() calls.
+# model_calib.gptq() resets this per invocation (per decoder layer under
+# layerwise) and prints the aggregate, so the per-layer cost decomposes into
+# Hessian factorization vs. the blockwise recurrence vs. objective evaluation.
+GPTQ_PHASE_TIMES: dict[str, float] = collections.defaultdict(float)
+
+
+@contextlib.contextmanager
+def _timed_phase(phase: str):
+    """Accumulate synchronized wall time for one GPTQ phase into GPTQ_PHASE_TIMES."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.time()
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        GPTQ_PHASE_TIMES[phase] += time.time() - start
+
 
 def update_hessian(input, hessian, n_samples):
-    """Update hessian matrix with new input samples using incremental formula.
+    """Accumulate raw ``X^T X`` from new input samples into ``hessian`` in-place.
+
+    Normalization is deferred: callers must apply :func:`finalize_hessian`
+    (``H *= 2/n``) once after the last batch. The previous incremental-averaging
+    form rescaled the entire ``features x features`` Hessian on every call,
+    which dominated collection time for MoE experts (one call per expert per
+    calibration window); deferring the ``2/n`` factor computes the same value
+    up to floating-point summation order.
 
     Args:
         input: Input tensor (batch_size, ..., features)
-        hessian: Current Hessian matrix to update in-place
-        n_samples: Number of samples already processed
+        hessian: Unnormalized Hessian accumulator, updated in-place
+        n_samples: Number of samples already accumulated
     Returns:
         Tuple of (updated_hessian, new_sample_count)
-
-    Note: input must be non-empty (batch_size > 0); a zero-sized input causes division by zero.
     """
-    # Flatten to 2D (total_tokens, features) first, so batch_size counts tokens
-    input_flat = input.reshape(-1, input.shape[-1]).t().float()
-    batch_size = input_flat.shape[1]
+    with _timed_phase("hessian_update_op"):
+        # Flatten to 2D (total_tokens, features) first, so batch_size counts tokens
+        input_flat = input.reshape(-1, input.shape[-1]).float()
+        batch_size = input_flat.shape[0]
 
-    if batch_size == 0:  # in MOEs some experts receive no tokens
-        return hessian, n_samples
+        if batch_size == 0:  # in MOEs some experts receive no tokens
+            return hessian, n_samples
 
-    # Incremental averaging: scale down old hessian
-    hessian *= n_samples / (n_samples + batch_size)
-    n_samples += batch_size
-
-    # Compute outer product: H += (2/n_samples) * X @ X^T
-    scaled_input = math.sqrt(2 / n_samples) * input_flat
-    hessian.add_((scaled_input @ scaled_input.t()).to(hessian.device))
+        n_samples += batch_size
+        hessian.add_((input_flat.t() @ input_flat).to(hessian.device))
 
     return hessian, n_samples
+
+
+def finalize_hessian(hessian, n_samples):
+    """Apply the ``2/n`` normalization deferred by :func:`update_hessian`.
+
+    Must be called exactly once per Hessian after collection completes; every
+    consumer downstream (damping, factorization, diagnostics, objective
+    metrics) expects the normalized form ``(2/n) * sum(X^T X)``.
+    """
+    if n_samples:
+        hessian *= 2.0 / n_samples
+    return hessian
 
 
 def compute_hessian_inverse(
@@ -125,11 +169,40 @@ def compute_hessian_inverse(
     h[diag_indices, diag_indices] += damp
 
     try:
+        step = "cholesky(H)"
         h = torch.cholesky_inverse(torch.linalg.cholesky(h))
+        step = "cholesky(H_inv)"
         return torch.linalg.cholesky(h, upper=True).to(
             device=result_device, dtype=weight.dtype
         )
-    except (RuntimeError, torch.linalg.LinAlgError):
+    except (RuntimeError, torch.linalg.LinAlgError) as e:
+        diag = torch.diag(hessian)
+        print_rank_0(
+            f"Hessian factorization diagnostics: step={step}, error={str(e)[:120]!r}, "
+            f"nan={torch.isnan(hessian).sum().item()}, inf={torch.isinf(hessian).sum().item()}, "
+            f"diag[min={diag.min().item():.3e}, max={diag.max().item():.3e}, "
+            f"mean={diag.mean().item():.3e}], damp={damp.item():.3e}"
+        )
+        if perc_damp < 0.1:
+            # Measured failure mode (GLM-5.2 gate_up experts): outlier channels
+            # next to nearly-dead ones give a 1e4x+ diagonal dynamic range, and
+            # fp32 accumulation noise pushes zero-support eigenvalues below
+            # -damp (min eig -2.1e-6 vs damp +1.7e-6). Precision is ruled out
+            # (fp64 fails identically), so retry once with perc_damp=0.1, which
+            # clears the measured deficit with ~40x margin. Only the degenerate
+            # modules pay the heavier damping.
+            print_rank_0(
+                f"Warning: Hessian indefinite at perc_damp={perc_damp}; "
+                "retrying with perc_damp=0.1"
+            )
+            return compute_hessian_inverse(
+                hessian, weight, 0.1, factorization_device, factorization_dtype
+            )
+        dump_dir = os.environ.get("MODELOPT_GPTQ_FAILED_HESSIAN_DIR")
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+            idx = len(os.listdir(dump_dir))
+            torch.save(hessian.cpu(), os.path.join(dump_dir, f"failed_hessian_{idx}.pt"))
         print_rank_0("Warning: Hessian factorization failed; retaining scale-only RTN")
         return None
 
@@ -175,11 +248,32 @@ class GPTQHelper:
             )
         self.hessian = torch.zeros(in_features, in_features, dtype=torch.float32, device=device)
         self.n_samples = 0
+        self._pending: list[torch.Tensor] = []
+        self._pending_tokens = 0
         # Set by update_weights(); listed here for documentation.
         self.weight: torch.Tensor | None = None
         self.h_inv: torch.Tensor | None = None
         self.updated_amax: torch.Tensor | None = None
         self.sequential_loss: float | None = None
+
+    def _accumulate(self, input):
+        """Buffer one collection chunk; flush into the Hessian at the token threshold."""
+        chunk = input.reshape(-1, input.shape[-1])
+        if chunk.shape[0] == 0:  # in MOEs some experts receive no tokens
+            return
+        self._pending.append(chunk)
+        self._pending_tokens += chunk.shape[0]
+        if self._pending_tokens >= GPTQ_HESSIAN_FLUSH_TOKENS:
+            self._flush_pending()
+
+    def _flush_pending(self):
+        """Fold all buffered chunks into the Hessian with a single update."""
+        if not self._pending:
+            return
+        stacked = self._pending[0] if len(self._pending) == 1 else torch.cat(self._pending, dim=0)
+        self._pending = []
+        self._pending_tokens = 0
+        self.hessian, self.n_samples = update_hessian(stacked, self.hessian, self.n_samples)
 
     def setup(self):
         """Patch the module's forward to accumulate Hessian during the collection pass."""
@@ -191,9 +285,7 @@ class GPTQHelper:
                 hessian_input = self.input_quantizer(inp)
             else:
                 hessian_input = inp
-            gptq_helper.hessian, gptq_helper.n_samples = update_hessian(
-                hessian_input, gptq_helper.hessian, gptq_helper.n_samples
-            )
+            gptq_helper._accumulate(hessian_input)
 
             out = self._forward_no_gptq_hessian(input, *args, **kwargs)
 
@@ -202,11 +294,14 @@ class GPTQHelper:
         bind_forward_method(self.module, hessian_forward, self.CACHE_NAME)
 
     def cleanup(self):
-        """Unpatch the module's forward method."""
+        """Unpatch the module's forward method and flush buffered Hessian chunks."""
         unpatch_forward_method(self.module, self.CACHE_NAME)
+        self._flush_pending()
 
     def free(self):
         """Release Hessian and working tensors to reclaim memory."""
+        self._pending = []
+        self._pending_tokens = 0
         self.hessian = None
         self.weight = None
         self.h_inv = None
@@ -230,9 +325,10 @@ class GPTQHelper:
         and writes the result back to the module unless an optional RTN-relative
         calibration-loss guard rejects it.
         """
-        hessian = self.hessian.to(self.module.weight.device)
-        original_weight = self.module.weight.data.float()
-        self.weight = original_weight.clone()
+        with _timed_phase("hessian_weight_io"):
+            hessian = self.hessian.to(self.module.weight.device)
+            original_weight = self.module.weight.data.float()
+            self.weight = original_weight.clone()
         if not self._prepare_hessian_inverse(
             hessian, perc_damp, hessian_inverse_device, hessian_inverse_dtype
         ):
@@ -247,14 +343,16 @@ class GPTQHelper:
                 "rtn_relative_mse": None,
                 "gptq_mse_ratio_vs_rtn": None,
             }
-        self._blockwise_update(block_size, block_scale_update, dynamic_scale_candidates)
-        metrics = self._candidate_metrics(
-            original_weight,
-            hessian,
-            self.module.weight_quantizer,
-            compare_vs_rtn,
-            perc_damp,
-        )
+        with _timed_phase("blockwise_update"):
+            self._blockwise_update(block_size, block_scale_update, dynamic_scale_candidates)
+        with _timed_phase("objective_metrics"):
+            metrics = self._candidate_metrics(
+                original_weight,
+                hessian,
+                self.module.weight_quantizer,
+                compare_vs_rtn,
+                perc_damp,
+            )
         self._print_mse_error(metrics)
         if metrics["accepted"]:
             self.module.weight.data = self.weight.reshape(self.module.weight.shape).to(
@@ -279,13 +377,14 @@ class GPTQHelper:
     ):
         """Compute damped inverse Hessian and store as ``self.h_inv``."""
         assert self.weight is not None, "_prepare_hessian_inverse called before update_weights()"
-        self.h_inv = compute_hessian_inverse(
-            hessian,
-            self.weight,
-            perc_damp,
-            hessian_inverse_device,
-            hessian_inverse_dtype,
-        )
+        with _timed_phase("hessian_inverse"):
+            self.h_inv = compute_hessian_inverse(
+                hessian,
+                self.weight,
+                perc_damp,
+                hessian_inverse_device,
+                hessian_inverse_dtype,
+            )
         return self.h_inv is not None
 
     def _blockwise_update(
@@ -476,6 +575,8 @@ class FusedExpertGPTQHelper(GPTQHelper):
             weight.shape[-1], weight.shape[-1], dtype=torch.float32, device=device
         )
         self.n_samples = 0
+        self._pending = []
+        self._pending_tokens = 0
         self.weight = None
         self.h_inv = None
         self.updated_amax = None
@@ -490,15 +591,16 @@ class FusedExpertGPTQHelper(GPTQHelper):
 
         def collect(_quantizer, _args, output):
             if self.module._current_expert_idx == self.expert_idx:
-                self.hessian, self.n_samples = update_hessian(output, self.hessian, self.n_samples)
+                self._accumulate(output)
 
         self._hook = self.input_quantizer.register_forward_hook(collect)
 
     def cleanup(self):
-        """Remove the shared-input-quantizer collection hook."""
+        """Remove the collection hook and flush buffered Hessian chunks."""
         if self._hook is not None:
             self._hook.remove()
             self._hook = None
+        self._flush_pending()
 
     def update_weights(
         self,
@@ -512,9 +614,10 @@ class FusedExpertGPTQHelper(GPTQHelper):
         hessian_inverse_dtype="float32",
     ):
         """Run GPTQ on this expert slice and copy it into the fused parameter."""
-        hessian = self.hessian.to(self._weight_slice().device)
-        original_weight = self._weight_slice().float()
-        self.weight = original_weight.clone()
+        with _timed_phase("hessian_weight_io"):
+            hessian = self.hessian.to(self._weight_slice().device)
+            original_weight = self._weight_slice().float()
+            self.weight = original_weight.clone()
         if not self._prepare_hessian_inverse(
             hessian, perc_damp, hessian_inverse_device, hessian_inverse_dtype
         ):
@@ -529,14 +632,16 @@ class FusedExpertGPTQHelper(GPTQHelper):
                 "rtn_relative_mse": None,
                 "gptq_mse_ratio_vs_rtn": None,
             }
-        self._blockwise_update(block_size, block_scale_update, dynamic_scale_candidates)
-        metrics = self._candidate_metrics(
-            original_weight,
-            hessian,
-            self.quantizer,
-            compare_vs_rtn,
-            perc_damp,
-        )
+        with _timed_phase("blockwise_update"):
+            self._blockwise_update(block_size, block_scale_update, dynamic_scale_candidates)
+        with _timed_phase("objective_metrics"):
+            metrics = self._candidate_metrics(
+                original_weight,
+                hessian,
+                self.quantizer,
+                compare_vs_rtn,
+                perc_damp,
+            )
         self._print_mse_error(metrics)
         if metrics["accepted"]:
             self._weight_slice().copy_(self.weight.to(self._weight_slice().dtype))
